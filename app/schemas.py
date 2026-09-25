@@ -261,6 +261,68 @@ class GlazeSeparationOut(BaseModel):
     kilns: list[KilnOut] = Field(..., description="建议装窑明细")
 
 
+class TemperatureSampleIn(BaseModel):
+    """单个温度采样点。"""
+
+    time: int = Field(..., strict=True, description="采样时刻（整数秒）")
+    temperature: int = Field(..., strict=True, description="采样温度（整数）")
+
+
+class TemperatureCheckIn(BaseModel):
+    """窑次温控核验请求。"""
+
+    samples: list[TemperatureSampleIn] = Field(
+        ...,
+        min_length=1,
+        description="温度采样（至少 1 个采样点，时刻为严格递增的整数秒）",
+    )
+    min_hold_seconds: int = Field(
+        ..., strict=True, ge=1, description="最低连续保温秒数（正整数）"
+    )
+    max_interval_seconds: int = Field(
+        ..., strict=True, ge=1, description="最大采样间隔秒数（正整数）"
+    )
+
+    @model_validator(mode="after")
+    def _strictly_increasing_times(self):
+        for i, (prev, cur) in enumerate(
+            zip(self.samples, self.samples[1:]), start=2
+        ):
+            if cur.time <= prev.time:
+                raise ValueError(
+                    f"采样时刻必须严格递增: 第 {i} 个采样点时刻 {cur.time} "
+                    f"不大于前一时刻 {prev.time}"
+                )
+        return self
+
+
+class TemperatureCheckOut(BaseModel):
+    """窑次温控核验结果（只读计算，不改写原方案）。"""
+
+    plan_id: str = Field(..., description="方案 ID")
+    kiln_index: int = Field(..., description="窑次序号（从 1 开始）")
+    item_ids: list[str] = Field(..., description="该窑器物编号，按编号升序")
+    temp_low: int = Field(..., description="合格温区下界（该窑器物温区交集下界）")
+    temp_high: int = Field(..., description="合格温区上界（该窑器物温区交集上界）")
+    min_hold_seconds: int = Field(..., description="请求的最低连续保温秒数")
+    max_interval_seconds: int = Field(..., description="请求的最大采样间隔秒数")
+    start: str | None = Field(
+        ...,
+        description="最长合格时段起始时刻（秒，约分分数 p/q）；无正时长时段时为 null",
+    )
+    end: str | None = Field(
+        ...,
+        description="最长合格时段结束时刻（秒，约分分数 p/q）；无正时长时段时为 null",
+    )
+    duration_seconds: str = Field(
+        ...,
+        description="最长合格时段的精确秒数（约分分数 p/q）；无正时长时段时为 0/1",
+    )
+    meets_requirement: bool = Field(
+        ..., description="是否达标：duration_seconds 不低于 min_hold_seconds"
+    )
+
+
 class CancelItemsOut(BaseModel):
     """取消器物并重排的结果（另存为新方案，不改写原方案）。"""
 
