@@ -8,6 +8,8 @@ POST /plans/{plan_id}/production-limit   限窑次接单：在最多 max_kilns �
 POST /plans/{plan_id}/append-items       追加器物：填入原窑或追加窑次，另存为新方案
 POST /plans/{plan_id}/cancel-items       取消器物：紧凑重排，另存为新方案
 POST /plans/{plan_id}/glaze-separation   釉色隔离：提交互斥对，只读重求最少窑次建议
+POST /plans/{plan_id}/kilns/{index}/temperature-check
+                                         窑次温控核验：求落在合格温区的最长连续时段
 GET  /health                             健康检查
 """
 
@@ -15,6 +17,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from fractions import Fraction
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -27,6 +30,7 @@ from .schemas import (
     CapacityTargetIn,
     CapacityTargetOut,
     ErrorOut,
+    FractionOut,
     GlazeSeparationIn,
     GlazeSeparationOut,
     KilnOut,
@@ -37,6 +41,9 @@ from .schemas import (
     PlanOut,
     ProductionLimitIn,
     ProductionLimitOut,
+    QualifiedPeriodOut,
+    TemperatureCheckIn,
+    TemperatureCheckOut,
 )
 from .solver import (
     CapacityExceededError,
@@ -49,6 +56,7 @@ from .solver import (
     select_within_kiln_limit,
     solve,
 )
+from .temperature import longest_qualified_period
 
 app = FastAPI(
     title="陶艺工作室共窑排程 API",
@@ -605,4 +613,74 @@ def glaze_separation(
             )
             for idx, k in enumerate(kilns, start=1)
         ],
+    )
+
+
+@app.post(
+    "/plans/{plan_id}/kilns/{index}/temperature-check",
+    response_model=TemperatureCheckOut,
+    tags=["plans"],
+    responses={
+        404: {"model": ErrorOut, "description": "方案或窑次不存在"},
+    },
+    summary="窑次温控核验：求落在合格温区的最长连续时段",
+)
+def kiln_temperature_check(
+    plan_id: str, index: int, payload: TemperatureCheckIn
+) -> TemperatureCheckOut:
+    plan = database.get_plan(plan_id)
+    if plan is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "PLAN_NOT_FOUND",
+                "message": f"未找到排程方案: {plan_id}",
+            },
+        )
+
+    kiln = next((k for k in plan["kilns"] if k["index"] == index), None)
+    if kiln is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "KILN_NOT_FOUND",
+                "message": (
+                    f"方案 {plan_id} 不存在窑次 {index}: "
+                    f"共 {plan['kiln_count']} 窑，"
+                    f"窑次序号须在 1～{plan['kiln_count']} 之间"
+                ),
+            },
+        )
+
+    # 合格温区 = 该窑器物温区交集（闭区间）；只读计算，不改写原方案。
+    by_id = {it["item_id"]: it for it in plan["items"]}
+    kiln_items = [by_id[i] for i in kiln["item_ids"]]
+    temp_low = max(it["temp_low"] for it in kiln_items)
+    temp_high = min(it["temp_high"] for it in kiln_items)
+
+    start, end, duration = longest_qualified_period(
+        [(s.time, s.temperature) for s in payload.samples],
+        temp_low,
+        temp_high,
+        payload.max_interval_seconds,
+    )
+
+    def _fraction_out(value: Fraction) -> FractionOut:
+        return FractionOut(numerator=value.numerator, denominator=value.denominator)
+
+    return TemperatureCheckOut(
+        plan_id=plan["id"],
+        kiln_index=index,
+        item_ids=list(kiln["item_ids"]),
+        temp_low=temp_low,
+        temp_high=temp_high,
+        sample_count=len(payload.samples),
+        min_hold_seconds=payload.min_hold_seconds,
+        max_interval_seconds=payload.max_interval_seconds,
+        longest_period=QualifiedPeriodOut(
+            start=_fraction_out(start) if start is not None else None,
+            end=_fraction_out(end) if end is not None else None,
+            duration=_fraction_out(duration),
+        ),
+        meets_requirement=duration >= payload.min_hold_seconds,
     )

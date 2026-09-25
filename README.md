@@ -5,7 +5,8 @@
 **最少窑次**方案，并在窑次相同时选择**整体字典序最小**的方案。
 已保存的方案支持目标窑次容量反查、限窑次接单、追加器物（填入原窑或追加窑次，
 另存为新方案）、**取消器物后的紧凑重排**（另存为新方案）、**釉色隔离**
-（提交器物互斥对，只读重求最少窑次建议）与两版方案差异对比。
+（提交器物互斥对，只读重求最少窑次建议）、**窑次温控核验**（按温度采样求
+落在合格温区内的最长连续时段）与两版方案差异对比。
 
 技术栈：Python 3.12 · FastAPI · SQLite · Uvicorn。
 
@@ -513,6 +514,88 @@ curl -s -X POST http://localhost:8000/plans/9c05e113e3e0430eb552a0bd01036dbb/gla
 - `422`：请求参数非法（列表为空 / 对不是恰好两个编号 / 两端编号相同 /
   互斥对重复（含顺序相反）/ 编号为空白字符串 / 缺少字段等）。
 
+### 9. 窑次温控核验（求落在合格温区的最长连续时段）
+
+`POST http://localhost:8000/plans/{id}/kilns/{index}/temperature-check`
+
+针对**已保存**方案的**某一窑次**（`index` 为窑次序号，从 1 开始），提交该窑
+烧成过程的**温度采样**，核验温度落在**合格温区**内的连续保温表现：
+
+- 合格温区 = 该窑全部器物温区的**交集**（闭区间
+  `[max(temp_low), min(temp_high)]`）；
+- 相邻采样点之间温度按**线性**变化；采样时刻必须**严格递增**；
+- 相邻采样间隔**超过 `max_interval_seconds` 时曲线断开**（该间隔内不插值），
+  且**不在首末采样点之外外推**；
+- 温度穿越温区边界的时刻一般为有理数，全程以**精确分数**计算，
+  起止时刻与时长均以**约分分数**（分子 / 分母，分母为正）返回；
+- 返回**最长**连续合格时段，**等长取开始最早**者；无正时长时段时
+  起止为 `null`、时长为 `0`；
+- `meets_requirement`：最长合格时段时长是否 **≥ `min_hold_seconds`**。
+
+**只读计算，不改写原方案。**
+
+请求体：
+
+```json
+{
+  "samples": [
+    {"time": 0,  "temperature": 120},
+    {"time": 10, "temperature": 180},
+    {"time": 20, "temperature": 230},
+    {"time": 30, "temperature": 200},
+    {"time": 40, "temperature": 160}
+  ],
+  "min_hold_seconds": 8,
+  "max_interval_seconds": 12
+}
+```
+
+字段约束：`samples` 至少 1 个采样点；`time` / `temperature` 均为整数，
+`time` 严格递增；`min_hold_seconds` 与 `max_interval_seconds` 为正整数。
+
+curl 示例（沿第 1 节方案，核验窑 2 —— 器物 `p2`、`p3`，合格温区 150～220）：
+
+```bash
+curl -s -X POST http://localhost:8000/plans/9c05e113e3e0430eb552a0bd01036dbb/kilns/2/temperature-check \
+  -H 'Content-Type: application/json' \
+  -d '{"samples": [{"time": 0, "temperature": 120}, {"time": 10, "temperature": 180}, {"time": 20, "temperature": 230}, {"time": 30, "temperature": 200}, {"time": 40, "temperature": 160}], "min_hold_seconds": 8, "max_interval_seconds": 12}'
+```
+
+成功响应 `200 OK`：
+
+```json
+{
+  "plan_id": "9c05e113e3e0430eb552a0bd01036dbb",
+  "kiln_index": 2,
+  "item_ids": ["p2", "p3"],
+  "temp_low": 150,
+  "temp_high": 220,
+  "sample_count": 5,
+  "min_hold_seconds": 8,
+  "max_interval_seconds": 12,
+  "longest_period": {
+    "start":    {"numerator": 70, "denominator": 3},
+    "end":      {"numerator": 40, "denominator": 1},
+    "duration": {"numerator": 50, "denominator": 3}
+  },
+  "meets_requirement": true
+}
+```
+
+上例中温度曲线在 `t=5` 进入温区、`t=18` 穿出（触及上界 220 前），
+第一段合格时段为 `[5, 18]`；温度回落后于 `t=70/3` 再次进入温区并一直保持
+到末采样点 `t=40`，故最长合格时段为 `[70/3, 40]`，精确时长 `50/3` 秒 ≥ 8，
+判定达标。若把第 3 个采样点改为 `{"time": 25, "temperature": 230}`
+（与前一点间隔 15 > 12），曲线在该间隔处断开、不做插值，最长合格时段变为
+`[80/3, 40]`、时长 `40/3` 秒。
+
+错误情况：
+
+- `404` `PLAN_NOT_FOUND`：方案不存在；
+- `404` `KILN_NOT_FOUND`：窑次序号不存在（不在 `1～窑次数` 之间）；
+- `422`：采样或参数非法（采样点为空 / 时刻非严格递增 / 非整数 /
+  `min_hold_seconds`、`max_interval_seconds` 非正整数 / 缺少字段等）。
+
 ## 本地开发（不使用 Docker）
 
 ```bash
@@ -521,10 +604,11 @@ pip install -r requirements.txt
 KILN_DB_PATH=./kiln.db uvicorn app.main:app --reload
 ```
 
-运行求解器测试（无需第三方依赖，含 300 组随机用例的暴力枚举交叉验证）：
+运行求解器与温控核验测试（无需第三方依赖，含随机用例的独立暴力实现交叉验证）：
 
 ```bash
 python3 tests/test_solver.py
+python3 tests/test_temperature.py
 ```
 
 ## 算法说明（n ≤ 14）
@@ -593,16 +677,27 @@ n = 14 时与求解器同为万级枚举规模，典型耗时约 1～3 秒。
 最小」，且仍是只读计算。计算量与无互斥求解相同，n = 14 时典型耗时在
 1～2 秒以内。
 
+`temperature-check` 接口的温控核验：合格温区为该窑器物温区交集
+`[max(temp_low), min(temp_high)]`（闭区间）。对每个相邻采样段
+（间隔不超过上限者），温度关于时间**线性且单调**，故落在温区内的部分必为
+**单个闭子区间**，其端点即温度恰等于温区边界的穿越时刻（有理数）——
+用 `Fraction` 精确求出；再把在共享采样点处相接（前段止 == 后段起）的
+子区间**合并为连续时段**，取**时长最长、等长时开始最早**者。间隔超过
+`max_interval_seconds` 的相邻采样之间不插值（曲线断开），首末采样点之外
+不外推；退化为点的合格区间时长为 0，不计入结果。计算量为采样点数的线性级。
+
 ## 目录结构
 
 ```
 app/
-  solver.py     # 位掩码 DP + 字典序重建（纯函数，无框架依赖）
-  database.py   # SQLite 初始化与读写
-  schemas.py    # Pydantic 请求/响应模型
-  main.py       # FastAPI 路由
+  solver.py      # 位掩码 DP + 字典序重建（纯函数，无框架依赖）
+  temperature.py # 温控核验：线性插值 + Fraction 精确求最长合格时段
+  database.py    # SQLite 初始化与读写
+  schemas.py     # Pydantic 请求/响应模型
+  main.py        # FastAPI 路由
 tests/
   test_solver.py
+  test_temperature.py
 entrypoint.sh   # 安装依赖 → 初始化数据库 → 启动服务
 Dockerfile
 docker-compose.yml

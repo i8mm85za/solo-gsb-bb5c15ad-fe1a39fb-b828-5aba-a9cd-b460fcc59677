@@ -282,3 +282,78 @@ class CancelItemsOut(BaseModel):
         ..., description="原窑次与新窑次的一对一配对，按原窑次序号升序"
     )
     new_plan: PlanOut = Field(..., description="重排后另存的新方案完整内容")
+
+
+class TemperatureSampleIn(BaseModel):
+    """单个温度采样点。"""
+
+    time: int = Field(..., strict=True, description="采样时刻（整数秒）")
+    temperature: int = Field(..., strict=True, description="采样温度（整数）")
+
+
+class TemperatureCheckIn(BaseModel):
+    """窑次温控核验请求。"""
+
+    samples: list[TemperatureSampleIn] = Field(
+        ...,
+        min_length=1,
+        description="温度采样点（至少 1 个，时刻必须严格递增）",
+    )
+    min_hold_seconds: int = Field(
+        ..., strict=True, ge=1, description="最低连续保温秒数（正整数）"
+    )
+    max_interval_seconds: int = Field(
+        ...,
+        strict=True,
+        ge=1,
+        description="最大采样间隔秒数（正整数，相邻采样间隔超过它时曲线断开）",
+    )
+
+    @model_validator(mode="after")
+    def _strictly_increasing(self):
+        for prev, cur in zip(self.samples, self.samples[1:]):
+            if cur.time <= prev.time:
+                raise ValueError(
+                    f"采样时刻必须严格递增: 时刻 {prev.time} 之后出现 {cur.time}"
+                )
+        return self
+
+
+class FractionOut(BaseModel):
+    """约分分数（分母为正整数，分子与分母互质）。"""
+
+    numerator: int = Field(..., description="分子")
+    denominator: int = Field(..., description="分母（正整数）")
+
+
+class QualifiedPeriodOut(BaseModel):
+    """最长连续合格时段。"""
+
+    start: FractionOut | None = Field(
+        ..., description="起始时刻（秒）的约分分数；无正时长时段时为 null"
+    )
+    end: FractionOut | None = Field(
+        ..., description="结束时刻（秒）的约分分数；无正时长时段时为 null"
+    )
+    duration: FractionOut = Field(
+        ..., description="精确时长（秒）的约分分数；无正时长时段时为 0"
+    )
+
+
+class TemperatureCheckOut(BaseModel):
+    """窑次温控核验结果（只读计算，不改写原方案）。"""
+
+    plan_id: str = Field(..., description="原方案 ID")
+    kiln_index: int = Field(..., description="窑次序号（从 1 开始）")
+    item_ids: list[str] = Field(..., description="该窑器物编号，按编号升序")
+    temp_low: int = Field(..., description="合格温区下界（该窑器物温区交集下界）")
+    temp_high: int = Field(..., description="合格温区上界（该窑器物温区交集上界）")
+    sample_count: int = Field(..., description="采样点数")
+    min_hold_seconds: int = Field(..., description="请求的最低连续保温秒数")
+    max_interval_seconds: int = Field(..., description="请求的最大采样间隔秒数")
+    longest_period: QualifiedPeriodOut = Field(
+        ..., description="最长连续合格时段（等长取开始最早者）"
+    )
+    meets_requirement: bool = Field(
+        ..., description="最长合格时段时长是否达到最低连续保温秒数"
+    )
